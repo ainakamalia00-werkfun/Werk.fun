@@ -1,115 +1,211 @@
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { createClient } from "@supabase/supabase-js";
+import "./styles.css";
 
-:root {
-  --ink: #18231f;
-  --muted: #718078;
-  --line: #e1e8e4;
-  --soft: #f4f7f5;
-  --green: #4fb761;
-  --green-dark: #258a4c;
-  --navy: #122e42;
-  --blue: #477cf3;
-  --red: #f05252;
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
+
+const STATUS_OPTIONS = [
+  { code: "WORKING", label: "Working", description: "Check in at your assigned location", tone: "green", icon: "W" },
+  { code: "OFF", label: "Not Working", description: "Rest day or scheduled off day", tone: "slate", icon: "O" },
+  { code: "EL", label: "Emergency Leave", description: "Unplanned urgent leave", tone: "orange", icon: "E" },
+  { code: "SL", label: "Sick Leave", description: "Unable to work due to illness", tone: "red", icon: "S" },
+  { code: "AL", label: "Annual Leave", description: "Approved annual leave", tone: "blue", icon: "A" },
+  { code: "MC", label: "Medical Certificate", description: "Medical leave with certificate", tone: "purple", icon: "M" },
+  { code: "OUTSTATION", label: "Outstation", description: "Working away from your assigned site", tone: "teal", icon: "OS" },
+];
+const STATUS_LABELS = Object.fromEntries(STATUS_OPTIONS.map((item) => [item.code, item.label]));
+
+function employeeMap(value) {
+  if (!value) return null;
+  return {
+    companyId: value.company_id, employeeId: value.employee_id, name: value.name,
+    entity: value.entity, assignedSite: value.assigned_site, radiusMeters: value.radius_meters,
+  };
+}
+function recordMap(value) {
+  if (!value) return null;
+  return {
+    id: value.id, workDate: value.work_date, status: value.status, note: value.note || "",
+    checkInAt: value.check_in_at, checkOutAt: value.check_out_at,
+    checkInDistanceMeters: value.check_in_distance_meters,
+  };
+}
+function formatTime(value) {
+  if (!value) return "—";
+  return new Intl.DateTimeFormat("en-MY", { timeZone: "Asia/Kuching", hour: "2-digit", minute: "2-digit", hour12: true }).format(new Date(value));
+}
+function formatDate(value) {
+  const date = typeof value === "string" ? new Date(`${value}T12:00:00+08:00`) : value;
+  return new Intl.DateTimeFormat("en-MY", { timeZone: "Asia/Kuching", weekday: "short", day: "2-digit", month: "short", year: "numeric" }).format(date);
+}
+function Logo({ compact = false }) {
+  return <div className={`logo ${compact ? "logo-compact" : ""}`} aria-label="FTA Staff Attendance">
+    <span className="logo-symbol">F</span><span className="logo-word">FTA</span>{!compact && <span className="logo-subtitle">STAFF</span>}
+  </div>;
 }
 
-* { box-sizing: border-box; }
-html, body { min-height: 100%; }
-body {
-  margin: 0;
-  background: #f8faf9;
-  color: var(--ink);
-  font-family: var(--font-geist), Arial, Helvetica, sans-serif;
+function App() {
+  const [employee, setEmployee] = useState(undefined);
+  const [today, setToday] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginError, setLoginError] = useState("");
+  const [view, setView] = useState("status");
+  const [selectedStatus, setSelectedStatus] = useState("WORKING");
+  const [note, setNote] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [now, setNow] = useState(new Date());
+  const [coordinates, setCoordinates] = useState(null);
+  const [locationState, setLocationState] = useState("idle");
+  const [locationMessage, setLocationMessage] = useState("Location not verified yet");
+  const token = () => localStorage.getItem("fta_session");
+
+  const loadHistory = useCallback(async () => {
+    if (!supabase || !token()) return [];
+    const { data } = await supabase.rpc("attendance_history", { p_token: token() });
+    const rows = Array.isArray(data) ? data.map(recordMap) : [];
+    setHistory(rows);
+    return rows;
+  }, []);
+
+  const refreshSession = useCallback(async () => {
+    if (!supabase || !token()) { setEmployee(null); return false; }
+    const { data } = await supabase.rpc("get_employee_session", { p_token: token() });
+    if (!data?.employee) { localStorage.removeItem("fta_session"); setEmployee(null); return false; }
+    setEmployee(employeeMap(data.employee));
+    setToday(recordMap(data.today));
+    await loadHistory();
+    setView(data.today ? "home" : "status");
+    return true;
+  }, [loadHistory]);
+
+  useEffect(() => { refreshSession(); }, [refreshSession]);
+  useEffect(() => { const timer = window.setInterval(() => setNow(new Date()), 1000); return () => window.clearInterval(timer); }, []);
+  const clock = useMemo(() => new Intl.DateTimeFormat("en-MY", { timeZone: "Asia/Kuching", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }).format(now), [now]);
+
+  async function login(event) {
+    event.preventDefault();
+    if (!supabase) return setLoginError("Supabase is not connected yet. Add the environment variables in Netlify.");
+    setLoginBusy(true); setLoginError("");
+    const form = new FormData(event.currentTarget);
+    const { data, error } = await supabase.rpc("login_employee", {
+      p_company_id: form.get("companyId"), p_employee_id: form.get("employeeId"), p_password: form.get("password"),
+    });
+    if (error || !data?.token) { setLoginError(error?.message || data?.error || "Unable to sign in."); setLoginBusy(false); return; }
+    localStorage.setItem("fta_session", data.token);
+    setEmployee(employeeMap(data.employee)); setToday(recordMap(data.today));
+    await loadHistory(); setView(data.today ? "home" : "status"); setLoginBusy(false);
+  }
+  async function logout() {
+    if (supabase && token()) await supabase.rpc("logout_employee", { p_token: token() });
+    localStorage.removeItem("fta_session"); setEmployee(null); setToday(null); setHistory([]); setView("status"); setLocationState("idle");
+  }
+  async function submitStatus() {
+    setActionBusy(true); setMessage("");
+    const { data, error } = await supabase.rpc("set_daily_status", { p_token: token(), p_status: selectedStatus, p_note: note });
+    if (!error && data?.today) {
+      const record = recordMap(data.today); setToday(record);
+      setMessage(selectedStatus === "WORKING" ? "Work status selected. Verify your location to check in." : "Your status has been recorded for today.");
+      setView("home"); await loadHistory();
+    } else setMessage(error?.message || data?.error || "Unable to save your status.");
+    setActionBusy(false);
+  }
+  function getBrowserLocation() {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) return reject(new Error("Location services are not supported on this device."));
+      navigator.geolocation.getCurrentPosition(
+        (position) => resolve({ latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy: position.coords.accuracy }),
+        () => reject(new Error("Please allow location access in your browser settings and try again.")),
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 },
+      );
+    });
+  }
+  async function verifyLocation() {
+    setLocationState("checking"); setLocationMessage("Checking your current location…");
+    try {
+      const coords = await getBrowserLocation(); setCoordinates(coords);
+      const { data, error } = await supabase.rpc("verify_workplace_location", {
+        p_token: token(), p_latitude: coords.latitude, p_longitude: coords.longitude,
+      });
+      if (!error && data?.allowed) { setLocationState("verified"); setLocationMessage(`Location verified · ${data.distance_meters} m from ${employee.assignedSite}`); }
+      else { setLocationState("outside"); setLocationMessage(error?.message || data?.error || "You are outside the approved check-in area."); }
+    } catch (error) { setLocationState("error"); setLocationMessage(error.message || "Unable to get your location."); }
+  }
+  async function attendanceAction(action) {
+    setActionBusy(true); setMessage("");
+    let coords = coordinates;
+    if (!coords) { try { coords = await getBrowserLocation(); } catch { coords = null; } }
+    if (!coords) { setMessage("Please allow location access and try again."); setActionBusy(false); return; }
+    const { data, error } = await supabase.rpc("record_attendance", {
+      p_token: token(), p_action: action === "check-in" ? "CHECK_IN" : "CHECK_OUT",
+      p_latitude: coords.latitude, p_longitude: coords.longitude, p_accuracy: coords.accuracy || null,
+    });
+    if (!error && data?.today) {
+      setToday(recordMap(data.today)); setMessage(action === "check-in" ? "Check-in successful." : "Check-out successful. Have a good rest!"); await loadHistory();
+    } else { setMessage(error?.message || data?.error || "Unable to update your attendance."); if (data?.outside) setLocationState("outside"); }
+    setActionBusy(false);
+  }
+
+  if (employee === undefined) return <main className="loading-screen"><Logo /><span className="spinner" /><p>Loading staff portal…</p></main>;
+  if (!employee) return <main className="login-screen">
+    <div className="login-box"><Logo /><h1>Sign in to Your Account</h1><p className="login-lead">Use your staff credentials to continue.</p>
+      <form onSubmit={login}>
+        <label htmlFor="companyId">Company ID</label><input id="companyId" name="companyId" placeholder="e.g. FTA" required />
+        <label htmlFor="employeeId">Employee ID</label><input id="employeeId" name="employeeId" placeholder="Enter Employee ID" required />
+        <label htmlFor="password">Password</label><input id="password" name="password" type="password" placeholder="Enter Password" required />
+        <label className="remember-row"><input type="checkbox" name="remember" /> Remember me</label>
+        {loginError && <p className="form-error" role="alert">{loginError}</p>}
+        <button className="primary-button" type="submit" disabled={loginBusy}>{loginBusy ? "Signing in…" : "Login"}</button>
+      </form>
+      <button className="forgot-button" type="button">Forgot Password?</button>
+      <div className="demo-note"><strong>Demo access</strong><span>FTA · FTA0001 · FTA2026</span></div>
+    </div><p className="powered-by">Powered by <strong>FTA Digital</strong></p>
+  </main>;
+
+  return <main className="app-shell">
+    <header className="topbar"><Logo compact /><div className="employee-chip">
+      <span className="avatar">{employee.name.split(" ").map((part) => part[0]).slice(0, 2).join("")}</span>
+      <span><strong>{employee.name}</strong><small>{employee.employeeId} · {employee.entity}</small></span>
+      <button onClick={logout}>Sign out</button>
+    </div></header>
+    <nav className="tabbar"><button className={view === "home" || view === "status" ? "active" : ""} onClick={() => setView(today ? "home" : "status")}><span>⌂</span>Home</button><button className={view === "history" ? "active" : ""} onClick={() => setView("history")}><span>▤</span>History</button></nav>
+    <div className="content-wrap">
+      {view === "status" && <section className="status-section">
+        <div className="section-heading"><span className="date-pill">{formatDate(now)}</span><h1>What is your work status today?</h1><p>Select one option before proceeding to attendance.</p></div>
+        <div className="status-grid">{STATUS_OPTIONS.map((option) => <button key={option.code} className={`status-card ${selectedStatus === option.code ? "selected" : ""}`} onClick={() => setSelectedStatus(option.code)}>
+          <span className={`status-icon ${option.tone}`}>{option.icon}</span><span><strong>{option.label}</strong><small>{option.description}</small></span><span className="radio-dot" />
+        </button>)}</div>
+        {selectedStatus !== "WORKING" && <label className="note-field">Note or reason (optional)<textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Add a short note for HR" /></label>}
+        <button className="primary-button continue-button" onClick={submitStatus} disabled={actionBusy}>{actionBusy ? "Saving…" : "Continue"}</button>
+      </section>}
+      {view === "home" && today?.status !== "WORKING" && <section className="nonworking-panel">
+        <span className="success-ring">✓</span><p className="date-pill">{formatDate(now)}</p><h1>{STATUS_LABELS[today?.status] || today?.status}</h1><p>Your work status has been recorded for today.</p>
+        {today?.note && <div className="recorded-note">“{today.note}”</div>}<button className="secondary-button" onClick={() => { setSelectedStatus(today?.status || "OFF"); setView("status"); }}>Change today&apos;s status</button>
+      </section>}
+      {view === "home" && today?.status === "WORKING" && <section className="attendance-section">
+        <div className="attendance-card"><div className="card-title-row"><div><span className="eyebrow">ATTENDANCE PORTAL</span><h1>Today&apos;s attendance</h1></div><span className={`work-badge ${today.checkOutAt ? "done" : ""}`}>{today.checkOutAt ? "Completed" : "Working"}</span></div>
+          <div className="location-panel"><div className={`location-icon ${locationState}`}>◎</div><div><strong>{employee.assignedSite}</strong><span>{locationMessage}</span></div>{!today.checkInAt && <button onClick={verifyLocation} disabled={locationState === "checking"}>{locationState === "checking" ? "Checking…" : "Verify location"}</button>}</div>
+          <div className="clock-panel"><strong>{clock}</strong><span>{formatDate(now)}</span></div>
+          {!today.checkInAt && <button className="check-button check-in" onClick={() => attendanceAction("check-in")} disabled={actionBusy || locationState !== "verified"}><span>✓</span>{actionBusy ? "Checking in…" : "Check In"}</button>}
+          {today.checkInAt && !today.checkOutAt && <button className="check-button check-out" onClick={() => attendanceAction("check-out")} disabled={actionBusy}><span>✓</span>{actionBusy ? "Checking out…" : "Check Out"}</button>}
+          {today.checkOutAt && <div className="day-complete">Attendance completed for today</div>}{message && <p className="action-message">{message}</p>}
+        </div>
+        <div className="time-summary"><article><span>Check In</span><strong>{formatTime(today.checkInAt)}</strong><small>{today.checkInAt ? formatDate(today.workDate) : "Waiting for check-in"}</small></article><article><span>Check Out</span><strong>{formatTime(today.checkOutAt)}</strong><small>{today.checkOutAt ? formatDate(today.workDate) : "Not checked out yet"}</small></article></div>
+        {!today.checkInAt && <button className="change-status" onClick={() => setView("status")}>← Change today&apos;s status</button>}
+      </section>}
+      {view === "history" && <section className="history-section">
+        <div className="section-heading left"><span className="eyebrow">MY ATTENDANCE</span><h1>Recent records</h1><p>Your latest work statuses and check-in times.</p></div>
+        <div className="history-table-wrap"><table><thead><tr><th>Date</th><th>Status</th><th>Check In</th><th>Check Out</th><th>Location</th></tr></thead><tbody>
+          {history.length === 0 && <tr><td colSpan="5" className="empty-cell">No attendance records yet.</td></tr>}
+          {history.map((record) => <tr key={record.id}><td>{formatDate(record.workDate)}</td><td><span className={`table-status status-${record.status.toLowerCase()}`}>{STATUS_LABELS[record.status] || record.status}</span></td><td>{formatTime(record.checkInAt)}</td><td>{formatTime(record.checkOutAt)}</td><td>{record.checkInDistanceMeters == null ? "—" : `${Math.round(record.checkInDistanceMeters)} m from site`}</td></tr>)}
+        </tbody></table></div>
+      </section>}
+    </div>
+  </main>;
 }
-button, input, textarea { font: inherit; }
-button { cursor: pointer; }
 
-.loading-screen {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 18px;
-  color: var(--muted);
-}
-.spinner { width: 30px; height: 30px; border: 3px solid #dfe8e3; border-top-color: var(--green); border-radius: 50%; animation: spin .7s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-
-.logo { display: flex; align-items: center; justify-content: center; gap: 7px; }
-.logo-symbol {
-  width: 42px; height: 42px; display: grid; place-items: center;
-  border-radius: 10px; color: white; background: linear-gradient(145deg, #2aa357, #84c945);
-  font-size: 25px; font-weight: 900; font-style: italic; box-shadow: 0 7px 18px rgba(54, 155, 79, .22);
-}
-.logo-word { color: #173b56; font-size: 36px; font-weight: 900; letter-spacing: -.08em; }
-.logo-subtitle { align-self: flex-end; margin: 0 0 7px 3px; color: var(--green-dark); font-size: 10px; font-weight: 800; letter-spacing: .13em; }
-.logo-compact { justify-content: flex-start; }
-.logo-compact .logo-symbol { width: 31px; height: 31px; border-radius: 8px; font-size: 19px; }
-.logo-compact .logo-word { font-size: 25px; }
-
-.login-screen { min-height: 100vh; padding: 38px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: white; }
-.login-box { width: 100%; max-width: 450px; padding: 40px 42px 32px; border: 1px solid #e3e7e5; background: white; box-shadow: 0 18px 55px rgba(28, 55, 43, .055); }
-.login-box h1 { margin: 25px 0 7px; text-align: center; font-size: 22px; font-weight: 500; }
-.login-lead { margin: 0 0 25px; color: var(--muted); text-align: center; font-size: 13px; }
-.login-box form > label:not(.remember-row) { display: block; margin: 15px 0 6px; color: #506159; font-size: 12px; font-weight: 700; }
-.login-box input:not([type="checkbox"]) { width: 100%; height: 46px; padding: 0 13px; border: 1px solid #d6deda; border-radius: 5px; outline: none; background: #fff; }
-.login-box input:focus { border-color: var(--green-dark); box-shadow: 0 0 0 3px rgba(79,183,97,.1); }
-.remember-row { margin: 18px 0; display: flex; align-items: center; gap: 7px; font-size: 13px; }
-.remember-row input { accent-color: var(--green); }
-.primary-button { width: 100%; min-height: 46px; border: 0; border-radius: 5px; color: white; background: var(--green); font-weight: 800; transition: background .18s, transform .18s; }
-.primary-button:hover { background: var(--green-dark); }
-.primary-button:disabled { opacity: .6; cursor: wait; }
-.forgot-button { width: 100%; margin: 19px 0 0; border: 0; color: #df3737; background: none; font-size: 12px; }
-.form-error { margin: -8px 0 14px; color: #bd3030; font-size: 12px; }
-.demo-note { margin-top: 24px; padding: 11px 13px; display: flex; justify-content: space-between; gap: 12px; border-radius: 6px; color: #506159; background: #f4f8f5; font-size: 11px; }
-.demo-note span { color: #327c4a; font-weight: 700; }
-.powered-by { margin: 16px 0 0; color: #4e5854; font-size: 13px; }.powered-by strong { color: #4380e8; font-weight: 500; }
-
-.app-shell { min-height: 100vh; background: #fafcfb; }
-.topbar { height: 60px; padding: 0 clamp(20px, 4vw, 58px); display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); background: white; }
-.employee-chip { display: flex; align-items: center; gap: 10px; }
-.avatar { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 50%; color: white; background: #7e8c85; font-size: 11px; font-weight: 800; }
-.employee-chip > span:nth-child(2) { display: grid; line-height: 1.2; }.employee-chip strong { font-size: 12px; }.employee-chip small { margin-top: 3px; color: var(--muted); font-size: 10px; }
-.employee-chip button { margin-left: 8px; border: 0; color: #75847d; background: none; font-size: 11px; }
-.tabbar { width: min(670px, calc(100% - 40px)); height: 48px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid #dfe5e2; }
-.tabbar button { position: relative; border: 0; color: #607067; background: transparent; font-size: 11px; font-weight: 700; }
-.tabbar button span { display: block; margin-bottom: 2px; font-size: 16px; }.tabbar button.active { color: var(--blue); }.tabbar button.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 3px; background: var(--blue); }
-.content-wrap { width: min(880px, calc(100% - 34px)); margin: 28px auto 70px; }
-
-.section-heading { margin: 0 auto 25px; text-align: center; }.section-heading.left { margin-left: 0; text-align: left; }
-.section-heading h1 { margin: 10px 0 5px; font-size: 27px; letter-spacing: -.03em; }.section-heading p { margin: 0; color: var(--muted); font-size: 13px; }
-.date-pill { display: inline-block; color: var(--green-dark); font-size: 11px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
-.eyebrow { color: var(--green-dark); font-size: 10px; font-weight: 900; letter-spacing: .14em; }
-.status-section { max-width: 760px; margin: 0 auto; }
-.status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.status-card { min-height: 78px; padding: 13px 15px; display: grid; grid-template-columns: 42px 1fr 18px; gap: 12px; align-items: center; text-align: left; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: white; transition: border .16s, box-shadow .16s, transform .16s; }
-.status-card:hover { transform: translateY(-1px); box-shadow: 0 7px 20px rgba(27, 53, 42, .06); }.status-card.selected { border-color: var(--green); box-shadow: 0 0 0 3px rgba(79,183,97,.1); }
-.status-card > span:nth-child(2) { display: grid; }.status-card strong { font-size: 13px; }.status-card small { margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.35; }
-.status-icon { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 10px; font-size: 12px; font-weight: 900; }.status-icon.green { color: #248747; background: #e8f7ec; }.status-icon.slate { color: #61716a; background: #edf1ef; }.status-icon.orange { color: #c87523; background: #fff2df; }.status-icon.red { color: #d24545; background: #ffebeb; }.status-icon.blue { color: #356dcf; background: #eaf1ff; }.status-icon.purple { color: #7958c9; background: #f0ebff; }.status-icon.teal { color: #25898a; background: #e5f5f5; }
-.radio-dot { width: 17px; height: 17px; border: 2px solid #c7d0cc; border-radius: 50%; }.selected .radio-dot { border: 5px solid var(--green); }
-.note-field { margin-top: 16px; display: grid; gap: 7px; color: #53625b; font-size: 12px; font-weight: 700; }.note-field textarea { min-height: 75px; padding: 11px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; outline: none; }.note-field textarea:focus { border-color: var(--green); }
-.continue-button { max-width: 300px; margin: 22px auto 0; display: block; }
-
-.attendance-section { max-width: 700px; margin: 0 auto; }
-.attendance-card, .time-summary article, .nonworking-panel, .history-table-wrap { border: 1px solid #dfe6e2; border-radius: 8px; background: white; box-shadow: 0 10px 30px rgba(30, 55, 44, .045); }
-.attendance-card { padding: 22px 28px 24px; }
-.card-title-row { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; }.card-title-row h1 { margin: 5px 0 0; font-size: 20px; }.work-badge { padding: 6px 10px; border-radius: 999px; color: #27894a; background: #e8f7ec; font-size: 10px; font-weight: 800; }.work-badge.done { color: #3765c9; background: #eaf1ff; }
-.location-panel { margin-top: 20px; padding: 13px; display: grid; grid-template-columns: 35px 1fr auto; gap: 11px; align-items: center; border: 1px solid var(--line); border-radius: 7px; background: #f9fbfa; }.location-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; color: #728179; background: #ebf0ed; font-size: 20px; }.location-icon.verified { color: #218543; background: #e1f5e7; }.location-icon.outside, .location-icon.error { color: #ce3f3f; background: #fde8e8; }.location-icon.checking { animation: pulse 1s ease infinite; }
-@keyframes pulse { 50% { opacity: .45; } }
-.location-panel > div:nth-child(2) { display: grid; }.location-panel strong { font-size: 12px; }.location-panel span { margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.3; }.location-panel button { min-height: 31px; padding: 0 12px; border: 1px solid #cdd9d3; border-radius: 5px; color: #2e7347; background: white; font-size: 10px; font-weight: 800; }
-.clock-panel { margin: 24px 0 15px; padding-top: 20px; display: grid; justify-items: center; border-top: 1px solid var(--line); }.clock-panel strong { color: #515d58; font-size: clamp(35px, 7vw, 46px); letter-spacing: .04em; }.clock-panel span { margin-top: 3px; color: #53615a; font-size: 12px; }
-.check-button { width: 72%; min-height: 48px; margin: 0 auto; display: flex; align-items: center; justify-content: center; gap: 9px; border: 0; border-radius: 5px; color: white; font-size: 18px; font-weight: 800; }.check-button.check-in { background: var(--green); }.check-button.check-out { background: #ff5157; }.check-button:disabled { opacity: .45; cursor: not-allowed; }.check-button span { font-size: 20px; }
-.action-message { margin: 14px 0 0; color: #2f7f48; text-align: center; font-size: 11px; }.day-complete { padding: 13px; border-radius: 5px; color: #315f9e; background: #edf4ff; text-align: center; font-size: 12px; font-weight: 800; }
-.time-summary { margin-top: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }.time-summary article { padding: 18px; display: grid; justify-items: center; }.time-summary span { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; }.time-summary strong { margin: 10px 0 4px; color: #4d5954; font-size: 27px; }.time-summary small { color: var(--muted); font-size: 10px; }
-.change-status { margin: 16px auto 0; display: block; border: 0; color: #6b7a73; background: none; font-size: 11px; }
-
-.nonworking-panel { max-width: 530px; margin: 60px auto 0; padding: 45px; text-align: center; }.success-ring { width: 55px; height: 55px; margin: 0 auto 18px; display: grid; place-items: center; border-radius: 50%; color: white; background: var(--green); font-size: 26px; }.nonworking-panel h1 { margin: 12px 0 8px; font-size: 29px; }.nonworking-panel > p:not(.date-pill) { color: var(--muted); font-size: 13px; }.recorded-note { margin: 20px 0; padding: 12px; border-radius: 6px; color: #536159; background: var(--soft); font-size: 12px; }.secondary-button { min-height: 39px; padding: 0 18px; border: 1px solid #cfd8d4; border-radius: 5px; color: #3f6250; background: white; font-size: 11px; font-weight: 800; }
-
-.history-section { max-width: 820px; margin: 0 auto; }.history-table-wrap { overflow: hidden; }.history-table-wrap table { width: 100%; border-collapse: collapse; }.history-table-wrap th, .history-table-wrap td { padding: 14px 16px; border-bottom: 1px solid #edf1ef; text-align: left; font-size: 11px; }.history-table-wrap th { color: #69776f; background: #f7f9f8; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }.history-table-wrap tr:last-child td { border-bottom: 0; }.table-status { display: inline-block; padding: 5px 8px; border-radius: 999px; color: #327a49; background: #e8f6ec; font-size: 9px; font-weight: 800; }.status-off, .status-el, .status-sl, .status-al, .status-mc { color: #5f6d66; background: #eef2f0; }.empty-cell { padding: 40px !important; color: var(--muted); text-align: center !important; }
-
-@media (max-width: 700px) {
-  .login-screen { padding: 0; justify-content: flex-start; }.login-box { max-width: none; min-height: calc(100vh - 45px); padding: 55px 24px 25px; border: 0; box-shadow: none; }.powered-by { margin: auto 0 14px; }
-  .topbar { height: 58px; padding: 0 15px; }.employee-chip > span:nth-child(2), .employee-chip button { display: none; }
-  .content-wrap { width: calc(100% - 24px); margin-top: 20px; }.status-grid { grid-template-columns: 1fr; }.section-heading h1 { font-size: 23px; }
-  .attendance-card { padding: 18px 14px; }.location-panel { grid-template-columns: 34px 1fr; }.location-panel button { grid-column: 1 / -1; min-height: 38px; }.check-button { width: 100%; }.time-summary { grid-template-columns: 1fr; }
-  .history-table-wrap { overflow-x: auto; }.history-table-wrap table { min-width: 650px; }.demo-note { display: grid; text-align: center; }
-}
+createRoot(document.getElementById("root")).render(<App />);
